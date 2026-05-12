@@ -27,6 +27,7 @@ import (
 	"io/fs"
 	"math"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -1790,11 +1791,12 @@ func WithWindowsNetworkNamespace(ns string) SpecOpts {
 	}
 }
 
-// readLinker defines the ReadLink method locally.
+// readLinkStater defines the ReadLink/Lstat methods locally.
 // We keep this shim to ensure compatibility with build environments where
 // the standard library's fs.ReadLinkFS interface is not yet available or recognized.
-type readLinker interface {
+type readLinkStater interface {
 	ReadLink(name string) (string, error)
+	Lstat(name string) (os.FileInfo, error)
 }
 
 // openUserFile attempts to open a file within the root fs.
@@ -1809,23 +1811,60 @@ func openUserFile(root fs.FS, name string) (fs.File, error) {
 	// Check if the FS implements our local ReadLink interface.
 	// We use a local interface instead of fs.ReadLinkFS to avoid strict dependency
 	// issues in some build environments.
-	if lfs, ok := root.(readLinker); ok {
-		if target, lerr := lfs.ReadLink(name); lerr == nil {
-			// Use filepath.IsAbs to handle platform-agnostic absolute path checks
-			if filepath.IsAbs(target) {
-				// Re-anchor the absolute path to the root.
-				// e.g. /nix/store/... becomes nix/store/... (relative to root fs)
-				// We use filepath.Rel to safely strip the leading separator.
-				rel, rerr := filepath.Rel(string(filepath.Separator), target)
-				if rerr == nil {
-					// filepath.Rel might return OS-specific separators (backslashes on Windows).
-					// fs.Open strictly expects forward slashes, so we convert it.
-					return root.Open(filepath.ToSlash(rel))
-				}
-			}
-		}
+	if lfs, ok := root.(readLinkStater); ok {
+		return root.Open(extractSymlink(lfs, name))
 	}
 
 	// Return the original error if we couldn't resolve it
 	return nil, err
+}
+
+// maxSymlinkDepth is the maximum number of symlink resolutions to prevent loops.
+const maxSymlinkDepth = 8
+
+func extractSymlink(root readLinkStater, name string) string {
+	resolved := ""
+	remaining := strings.Split(filepath.ToSlash(name), string(filepath.Separator))
+	depth := 0
+
+	for len(remaining) > 0 {
+		// Pop the next component.
+		part := remaining[0]
+		remaining = remaining[1:]
+		resolved = path.Join(resolved, part)
+
+		fi, err := root.Lstat(resolved)
+		if err != nil {
+			return name
+		}
+
+		if fi.Mode()&os.ModeSymlink == 0 {
+			continue
+		}
+
+		depth++
+		if depth >= maxSymlinkDepth {
+			return name
+		}
+
+		target, err := root.ReadLink(resolved)
+		if err != nil {
+			return name
+		}
+
+		// Re-anchor absolute symlink targets to the root.
+		if filepath.IsAbs(target) {
+			rel, err := filepath.Rel(string(filepath.Separator), target)
+			if err != nil {
+				return name
+			}
+			target = filepath.ToSlash(rel)
+		}
+
+		// Restart resolution from the target with remaining components appended.
+		resolved = ""
+		remaining = append(strings.Split(target, "/"), remaining...)
+	}
+
+	return resolved
 }

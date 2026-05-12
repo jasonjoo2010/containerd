@@ -338,40 +338,70 @@ func TestOpenUserFile_AbsoluteSymlink(t *testing.T) {
 
 	expectedContent := []byte("root:x:0:0:root:/root:/bin/bash" + t.Name())
 
-	root := t.TempDir()
-	// Use 'continuity' library to create a directory structure simulating NixOS
-	if err := fstest.Apply(
-		fstest.CreateDir("/etc", 0o755),
-		fstest.CreateDir("/nix/store/abcd", 0o755),
-		fstest.CreateFile("/nix/store/abcd/passwd", expectedContent, 0o644),
-		// /etc/passwd -> /nix/store/abcd/passwd (absolute symlink)
-		fstest.Symlink("/nix/store/abcd/passwd", "/etc/passwd"),
-	).Apply(root); err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		name          string
+		fsInitializer func(t *testing.T) string
+	}{
+		{
+			name: "absolute symlink", fsInitializer: func(t *testing.T) string {
+				root := t.TempDir()
+				// Use 'continuity' library to create a directory structure simulating NixOS
+				if err := fstest.Apply(
+					fstest.CreateDir("/etc", 0o755),
+					fstest.CreateDir("/nix/store/abcd", 0o755),
+					fstest.CreateFile("/nix/store/abcd/passwd", expectedContent, 0o644),
+					// /etc/passwd -> /nix/store/abcd/passwd (absolute symlink)
+					fstest.Symlink("/nix/store/abcd/passwd", "/etc/passwd"),
+				).Apply(root); err != nil {
+					t.Fatal(err)
+				}
+				return root
+			},
+		},
+		{
+			name: "absolute symlink for folder", fsInitializer: func(t *testing.T) string {
+				// This is a common case for android emulator images where /etc is a symlink to /system/etc
+				root := t.TempDir()
+				if err := fstest.Apply(
+					fstest.CreateDir("/system/etc", 0o755),
+					fstest.CreateFile("/system/etc/passwd", expectedContent, 0o644),
+					// /etc -> /system/etc (absolute symlink)
+					fstest.Symlink("/system/etc", "/etc"),
+				).Apply(root); err != nil {
+					t.Fatal(err)
+				}
+				return root
+			},
+		},
 	}
 
-	rootFS := os.DirFS(root)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := tc.fsInitializer(t)
+			rootFS := os.DirFS(root)
 
-	// Ensure the FS implements the ReadLink interface.
-	// If the native os.DirFS doesn't implement it (depending on Go version),
-	// wrap it in our readLinkFS helper.
-	if _, ok := rootFS.(readLinker); !ok {
-		t.Logf("os.DirFS does not implement ReadLink; wrapping to use ReadLink")
-		rootFS = readLinkFS{root: root, fs: rootFS}
-	}
+			// Ensure the FS implements the ReadLink interface.
+			// If the native os.DirFS doesn't implement it (depending on Go version),
+			// wrap it in our readLinkFS helper.
+			if _, ok := rootFS.(readLinkStater); !ok {
+				t.Logf("os.DirFS does not implement ReadLink; wrapping to use ReadLink")
+				rootFS = readLinkFS{root: root, fs: rootFS}
+			}
 
-	f, err := openUserFile(rootFS, "etc/passwd")
-	if err != nil {
-		t.Fatalf("openUserFile failed on absolute symlink: %v", err)
-	}
-	defer f.Close()
+			f, err := openUserFile(rootFS, "etc/passwd")
+			if err != nil {
+				t.Fatalf("openUserFile failed on absolute symlink: %v", err)
+			}
+			defer f.Close()
 
-	content, err := io.ReadAll(f)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(content) != string(expectedContent) {
-		t.Errorf("expected content %q, got %q", string(expectedContent), string(content))
+			content, err := io.ReadAll(f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(content) != string(expectedContent) {
+				t.Errorf("expected content %q, got %q", string(expectedContent), string(content))
+			}
+		})
 	}
 }
 
@@ -393,7 +423,7 @@ func TestGroupLookup_AbsoluteSymlink(t *testing.T) {
 	}
 
 	rootFS := os.DirFS(root)
-	if _, ok := rootFS.(readLinker); !ok {
+	if _, ok := rootFS.(readLinkStater); !ok {
 		rootFS = readLinkFS{root: root, fs: rootFS}
 	}
 
@@ -431,4 +461,9 @@ func (r readLinkFS) Open(name string) (fs.File, error) {
 func (r readLinkFS) ReadLink(name string) (string, error) {
 	// Force link reading using the actual path on disk
 	return os.Readlink(filepath.Join(r.root, filepath.FromSlash(name)))
+}
+
+func (r readLinkFS) Lstat(name string) (os.FileInfo, error) {
+	// Force lstat using the actual path on disk
+	return os.Lstat(filepath.Join(r.root, filepath.FromSlash(name)))
 }
